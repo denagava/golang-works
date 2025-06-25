@@ -1,0 +1,134 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+)
+
+type OpenAIRequest struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenAIResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+func getNumberRange(IMT float64) string {
+	switch {
+	case IMT <= 16:
+		return "выраженный дефицит массы"
+	case IMT > 16 && IMT < 18.5:
+		return "недостаточная масса"
+	case IMT >= 18.5 && IMT < 25:
+		return "Нормальная масса"
+	case IMT >= 25 && IMT < 30:
+		return "избыточная масса"
+	case IMT >= 30:
+		return "ожирение"
+	default:
+		return "неопределенный результат"
+	}
+}
+func getAIGoalRecommendation(IMT float64, goal string, openAIKey string) (string, error) {
+	prompt := fmt.Sprintf(
+		"Мой ИМТ: %.1f (%s). Я хочу %s массу тела. "+
+			"Дай мне 5 конкретных рекомендаций с примером рациона и тренировок. "+
+			"Ответь на русском языке в формате markdown.",
+		IMT, getNumberRange(IMT), goal,
+	)
+
+	requestBody := OpenAIRequest{
+		Model: "gpt-3.5-turbo",
+		Messages: []Message{
+			{
+				Role:    "user",
+				Content: prompt,
+			},
+		},
+	}
+
+	bodyBytes, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("ошибка маршалига", err)
+	}
+	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("ошибка создания запроса", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+openAIKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("ошибка выполнения запроса", err)
+	}
+	defer resp.Body.Close()
+
+	var result OpenAIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("ошибка декода ответа", err)
+	}
+
+	if len(result.Choices) > 0 {
+		return result.Choices[0].Message.Content, nil
+	}
+
+	return "", fmt.Errorf("пустой ответ от API")
+}
+func readFloatInput(promt string) float64 {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print(promt)
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+		value, err := strconv.ParseFloat(input, 64)
+		if err == nil {
+			return value
+		}
+		fmt.Println("Ошибка введите коректное число")
+	}
+}
+func readInput(prompt string) string {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print(prompt)
+	input, _ := reader.ReadString('\n')
+	return strings.TrimSpace(input)
+}
+func main() {
+	fmt.Println("калькулятор индекса массы тела")
+	fmt.Println("--------------------------------")
+	openAIKey := readInput("Введите ваш OpenAI API ключ: ")
+	var userHeigh = readFloatInput("введите ваш рост в метрах")
+	userKg := readFloatInput("введите ваш вес в килограммах")
+	goal := readInput("Что вы хотите? (увеличить/уменьшить массу тела): ")
+	var IMT = userKg / math.Pow(userHeigh, 2)
+	fmt.Println("Индекс массы тела:", IMT)
+	fmt.Println("Категория:", getNumberRange(IMT))
+	recommendation, err := getAIGoalRecommendation(IMT, goal, openAIKey)
+	if err != nil {
+		fmt.Printf("\nОшибка при получении рекомендаций: %v\n", err)
+	} else {
+		fmt.Println("\nAI рекомендации:")
+		fmt.Println(recommendation)
+	}
+}
+
+///////////////// если интеграцией аишки будут проблемы (хотя не должно) катайте баг репорт может исправлю
