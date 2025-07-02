@@ -1,0 +1,432 @@
+package main
+
+import (
+	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	BootstrapPeer = "127.0.0.1:30000"
+	ListenPort    = ":0"
+	UDPBufferSize = 2048
+)
+
+type Peer struct {
+	Addr        *net.UDPAddr
+	PublicKey   *ecdh.PublicKey
+	SessionKey  []byte
+	Established bool
+}
+
+type Message struct {
+	Type     byte
+	Data     []byte
+	SenderID string
+}
+
+var (
+	peers      = make(map[string]*Peer)
+	peersMutex sync.Mutex
+	conn       *net.UDPConn
+	privateKey *ecdh.PrivateKey
+	publicKey  *ecdh.PublicKey
+	nodeID     string
+)
+
+func main() {
+	generateKeys()
+
+	go startNetwork()
+
+	startUI()
+	fmt.Printf("Correct local IP: %s\n", getLocalIP())
+}
+
+func generateKeys() {
+	curve := ecdh.P256()
+	var err error
+	privateKey, err = curve.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Fatal("Key generation failed:", err)
+	}
+	publicKey = privateKey.PublicKey()
+	nodeID = hex.EncodeToString(publicKey.Bytes())[:16]
+}
+
+func deriveSharedSecret(peerPub *ecdh.PublicKey) []byte {
+	secret, err := privateKey.ECDH(peerPub)
+	if err != nil {
+		log.Println("ECDH failed:", err)
+		return nil
+	}
+	return secret
+}
+
+func encryptMessage(key []byte, plaintext string) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return ciphertext, nil
+}
+
+func decryptMessage(key []byte, ciphertext []byte) (string, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return "", errors.New("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return string(plaintext), nil
+}
+
+func startNetwork() {
+	addr, err := net.ResolveUDPAddr("udp", ListenPort)
+	if err != nil {
+		log.Fatal("Resolve error:", err)
+	}
+
+	conn, err = net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatal("Listen error:", err)
+	}
+	defer conn.Close()
+
+	if conn == nil {
+		log.Fatal("UDP connection is nil")
+	}
+
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		log.Fatal("Failed to get UDP address")
+	}
+	fmt.Printf("Listening on UDP port %d\n", localAddr.Port)
+
+	go connectToBootstrap()
+
+	buf := make([]byte, UDPBufferSize)
+	for {
+		n, addr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Println("Read error:", err)
+			continue
+		}
+
+		go handleMessage(buf[:n], addr)
+	}
+}
+
+func handleMessage(data []byte, addr *net.UDPAddr) {
+	if len(data) < 2 {
+		return
+	}
+
+	msgType := data[0]
+	payload := data[1:]
+
+	switch msgType {
+	case 0x01: // Handshake Init
+		handleHandshakeInit(payload, addr)
+	case 0x02: // Handshake Response
+		handleHandshakeResponse(payload, addr)
+	case 0x03: // Encrypted Message
+		handleEncryptedMessage(payload, addr)
+	}
+	fmt.Printf("Received %d bytes from %s: [%x]\n", len(data), addr.String(), data[:min(10, len(data))])
+	fmt.Printf("Received type 0x%x from %s\n", msgType, addr)
+}
+
+func sendMessage(addr *net.UDPAddr, msgType byte, payload []byte) {
+	data := append([]byte{msgType}, payload...)
+	_, err := conn.WriteToUDP(data, addr)
+	if err != nil {
+		log.Println("Send error:", err)
+	}
+	fmt.Printf("Sending %d bytes to %s: [%x]\n", len(data), addr.String(), data[:min(10, len(data))])
+	if len(data) > 0 {
+		end := 16
+		if len(data) < end {
+			end = len(data)
+		}
+		fmt.Printf("Sending %d bytes to %s. First %d: [%x]\n",
+			len(data), addr.String(), end, data[:end])
+	} else {
+		fmt.Printf("Warning: sending 0 bytes to %s\n", addr.String())
+	}
+}
+
+// Handshake
+func handleHandshakeInit(data []byte, addr *net.UDPAddr) {
+	if len(data) < 32 {
+		return
+	}
+
+	//Парсинг ключа
+	peerPub, err := ecdh.P256().NewPublicKey(data)
+	if err != nil {
+		log.Println("Invalid public key:", err)
+		return
+	}
+
+	//Создание нового пира
+	peer := &Peer{
+		Addr:      addr,
+		PublicKey: peerPub,
+	}
+
+	peersMutex.Lock()
+	peers[addr.String()] = peer
+	peersMutex.Unlock()
+
+	//Отправка ответа спубличным ключом
+	sendMessage(addr, 0x02, publicKey.Bytes())
+}
+
+func handleHandshakeResponse(data []byte, addr *net.UDPAddr) {
+	peersMutex.Lock()
+	peer, exists := peers[addr.String()]
+	peersMutex.Unlock()
+
+	if !exists {
+		//Если пир не известен
+		sendMessage(addr, 0x01, publicKey.Bytes())
+		return
+	}
+
+	//Парсинг публичного ключа
+	peerPub, err := ecdh.P256().NewPublicKey(data)
+	if err != nil {
+		log.Println("Invalid public key:", err)
+		return
+	}
+
+	peer.PublicKey = peerPub
+	peer.SessionKey = deriveSharedSecret(peerPub)
+	peer.Established = true
+
+	fmt.Printf("\n[System] Secure connection established with %s\n> ", addr.String())
+}
+
+// Обработка сообщений
+func handleEncryptedMessage(data []byte, addr *net.UDPAddr) {
+	peersMutex.Lock()
+	peer, exists := peers[addr.String()]
+	peersMutex.Unlock()
+
+	if !exists || !peer.Established || len(peer.SessionKey) == 0 {
+		sendMessage(addr, 0x01, publicKey.Bytes())
+		return
+	}
+	fmt.Printf("Processing encrypted message from %s\n", addr)
+	// Дешифровка сообщения
+	plaintext, err := decryptMessage(peer.SessionKey, data)
+	if err != nil {
+		log.Println("Decryption failed:", err)
+		return
+	}
+
+	fmt.Printf("\n[Message from %s] %s\n> ", addr.String(), plaintext)
+	fmt.Printf("Decrypted message: %s\n", plaintext)
+}
+
+// Подключение к сети
+func connectToBootstrap() {
+	time.Sleep(1 * time.Second)
+
+	addr, err := net.ResolveUDPAddr("udp", BootstrapPeer)
+	if err != nil {
+		log.Println("Bootstrap resolve error:", err)
+		return
+	}
+
+	//инициации рукопожатия
+	sendMessage(addr, 0x01, publicKey.Bytes())
+	fmt.Printf("[System] Connecting to bootstrap node %s\n", BootstrapPeer)
+}
+
+// интерфейс
+func startUI() {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println("=== P2P Encrypted Chat ===")
+	fmt.Printf("Your Node ID: %s\n", nodeID)
+	fmt.Println("Type '/connect <ip:port>' to add peer")
+	fmt.Println("Type '/exit' to quit")
+	fmt.Println("--------------------------")
+
+	for {
+		fmt.Print("> ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		if input == "" {
+			continue
+		}
+
+		if strings.HasPrefix(input, "/") {
+			handleCommand(input)
+			continue
+		}
+
+		sendToAllPeers(input)
+	}
+}
+
+func handleCommand(cmd string) {
+	parts := strings.Split(cmd, " ")
+	switch parts[0] {
+	case "/connect":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /connect <ip:port>")
+			return
+		}
+		connectToPeer(parts[1])
+	case "/exit":
+		fmt.Println("Exiting...")
+		os.Exit(0)
+	case "/peers":
+		listPeers()
+	default:
+		fmt.Println("Unknown command:", cmd)
+	}
+}
+
+func connectToPeer(addrStr string) {
+	addr, err := net.ResolveUDPAddr("udp", addrStr)
+	if err != nil {
+		fmt.Println("Invalid address:", err)
+		return
+	}
+
+	//Проверка существующего соединения
+	peersMutex.Lock()
+	_, exists := peers[addr.String()]
+	peersMutex.Unlock()
+
+	if exists {
+		fmt.Println("Already connected to this peer")
+		return
+	}
+
+	peer := &Peer{
+		Addr: addr,
+	}
+
+	peersMutex.Lock()
+	peers[addr.String()] = peer
+	peersMutex.Unlock()
+
+	//handshake
+	sendMessage(addr, 0x01, publicKey.Bytes())
+	fmt.Printf("[System] Connecting to %s\n", addrStr)
+}
+
+func listPeers() {
+	peersMutex.Lock()
+	defer peersMutex.Unlock()
+
+	if len(peers) == 0 {
+		fmt.Println("No connected peers")
+		return
+	}
+
+	fmt.Println("Connected peers:")
+	for addr, peer := range peers {
+		status := "Pending"
+		if peer.Established {
+			status = "Encrypted"
+		}
+		fmt.Printf("- %s [%s]\n", addr, status)
+	}
+}
+
+func sendToAllPeers(message string) {
+	peersMutex.Lock()
+	defer peersMutex.Unlock()
+
+	if len(peers) == 0 {
+		fmt.Println("No peers connected. Use '/connect <ip:port>'")
+		return
+	}
+
+	for _, peer := range peers {
+		if !peer.Established || len(peer.SessionKey) == 0 {
+			continue
+		}
+
+		// Шифрование сообщения
+		ciphertext, err := encryptMessage(peer.SessionKey, message)
+		if err != nil {
+			log.Println("Encryption failed:", err)
+			continue
+		}
+
+		//Отправка
+		sendMessage(peer.Addr, 0x03, ciphertext)
+	}
+}
+
+func intToBytes(n int) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(n))
+	return buf
+}
+
+func bytesToInt(b []byte) int {
+	return int(binary.BigEndian.Uint64(b))
+}
+
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			return ipnet.IP.String()
+		}
+	}
+	return "127.0.0.1"
+}
